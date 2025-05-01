@@ -103,7 +103,9 @@ bash scripts/download_data.sh
 1. **Download LLaMA 3.1 8B model**:
 
 ```bash
-python src/data/download_model.py --model_name meta-llama/Meta-Llama-3.1-8B
+chmod +x src/data/download_model.py
+
+python src/data/download_model.py --model_name meta-llama/Meta-Llama-3.1-8B --use_auth_token
 ```
 
 2. **Prepare configuration**:
