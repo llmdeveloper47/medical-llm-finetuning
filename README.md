@@ -105,7 +105,7 @@ bash scripts/download_data.sh
 ```bash
 chmod +x src/data/download_model.py
 
-python src/data/download_model.py --model_name meta-llama/Meta-Llama-3.1-8B --use_auth_token
+python src/data/download_model.py --model_name meta-llama/Meta-Llama-3.1-8B --use_auth_token --hf_token "your_token_here"
 ```
 
 2. **Prepare configuration**:
