@@ -10,6 +10,8 @@ import os
 import subprocess
 import sys
 import time
+import json
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -34,6 +36,81 @@ from src.utils.logging_utils import get_logger
 
 
 logger = get_logger(__name__)
+
+
+def setup_wandb(config: Config, args: argparse.Namespace):
+    """
+    Set up Weights & Biases logging.
+    
+    Args:
+        config: Training configuration
+        args: Command-line arguments
+    
+    Returns:
+        True if wandb was initialized successfully, False otherwise
+    """
+    try:
+        import wandb
+    except ImportError:
+        logger.warning("wandb not installed. Install with 'pip install wandb' to use.")
+        return False
+    
+    # Check if WANDB_API_KEY is set
+    if not os.environ.get("WANDB_API_KEY"):
+        logger.warning("WANDB_API_KEY not set. WandB logging disabled.")
+        return False
+    
+    # Set up default values
+    wandb_project = args.wandb_project
+    wandb_entity = args.wandb_entity
+    wandb_run_name = args.wandb_run_name or f"medical-llama-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    
+    # Set up config for wandb
+    wandb_config = {
+        "model": {
+            "name": config.model.model_name,
+            "hidden_size": config.model.hidden_size,
+            "num_hidden_layers": config.model.num_hidden_layers,
+            "num_attention_heads": config.model.num_attention_heads,
+        },
+        "lora": {
+            "enabled": config.lora.use_lora,
+            "r": config.lora.r,
+            "alpha": config.lora.alpha,
+            "dropout": config.lora.dropout,
+            "target_modules": config.lora.target_modules,
+        },
+        "training": {
+            "learning_rate": config.train.learning_rate,
+            "weight_decay": config.train.weight_decay,
+            "batch_size": config.data.per_device_train_batch_size * torch.cuda.device_count(),
+            "gradient_accumulation_steps": config.train.gradient_accumulation_steps,
+            "epochs": config.train.num_train_epochs,
+            "warmup_ratio": config.train.warmup_ratio,
+            "max_seq_length": config.data.max_seq_length,
+        },
+        "hardware": {
+            "num_gpus": torch.cuda.device_count(),
+            "gpu_type": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "N/A",
+        }
+    }
+    
+    # Initialize wandb
+    try:
+        wandb.init(
+            project=wandb_project,
+            entity=wandb_entity,
+            name=wandb_run_name,
+            config=wandb_config,
+            job_type="training",
+            tags=["llama-3.1", "medical", "qlora"],
+            notes=f"Fine-tuning LLaMA 3.1 8B on medical QA dataset with QLoRA",
+        )
+        logger.info(f"WandB initialized: project={wandb_project}, run={wandb_run_name}")
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to initialize WandB: {e}")
+        return False
 
 
 def setup_fabric(config: Config) -> L.Fabric:
@@ -209,6 +286,7 @@ def train(
     val_dataloader: Optional[torch.utils.data.DataLoader] = None,
     config: Config = Config(),
     tokenizer: Optional[transformers.PreTrainedTokenizer] = None,
+    wandb_enabled: bool = False,
 ) -> None:
     """
     Main training loop.
@@ -221,6 +299,7 @@ def train(
         val_dataloader: Optional validation dataloader
         config: Training configuration
         tokenizer: Tokenizer for decoding examples
+        wandb_enabled: Whether wandb logging is enabled
     """
     # Create gradient scaler for mixed precision training
     scaler = torch.cuda.amp.GradScaler(enabled=(config.model.precision == "fp16"))
@@ -241,6 +320,21 @@ def train(
         num_warmup_steps=warmup_steps,
         num_training_steps=num_training_steps,
     )
+    
+    # Log training parameters
+    if wandb_enabled and fabric.global_rank == 0:
+        try:
+            import wandb
+            wandb.log({
+                "train/total_steps": num_training_steps,
+                "train/warmup_steps": warmup_steps,
+                "train/batch_size_per_device": config.data.per_device_train_batch_size,
+                "train/global_batch_size": config.data.per_device_train_batch_size * fabric.world_size * config.train.gradient_accumulation_steps,
+                "train/num_devices": fabric.world_size,
+                "train/gradient_accumulation_steps": config.train.gradient_accumulation_steps,
+            })
+        except Exception as e:
+            logger.warning(f"Failed to log to wandb: {e}")
     
     # Train for specified number of epochs
     for epoch in range(config.train.num_train_epochs):
@@ -286,14 +380,33 @@ def train(
                 if step_count % config.train.logging_steps == 0 and fabric.global_rank == 0:
                     avg_loss = total_loss / config.train.logging_steps
                     elapsed = time.time() - total_t0
+                    samples_per_second = config.train.gradient_accumulation_steps * config.data.per_device_train_batch_size * fabric.world_size / (time.time() - total_t0)
+                    
                     fabric.log("train/loss", avg_loss, step=step_count)
                     fabric.log("train/lr", lr_scheduler.get_last_lr()[0], step=step_count)
+                    
+                    # Log to wandb if available
+                    if wandb_enabled:
+                        try:
+                            import wandb
+                            wandb.log({
+                                "train/loss": avg_loss,
+                                "train/lr": lr_scheduler.get_last_lr()[0],
+                                "train/step": step_count,
+                                "train/epoch": epoch + 1,
+                                "train/global_step": step_count,
+                                "train/samples_per_second": samples_per_second,
+                                "train/elapsed_time": elapsed,
+                            })
+                        except Exception as e:
+                            logger.warning(f"Failed to log to wandb: {e}")
                     
                     logger.info(
                         f"Epoch: {epoch+1}/{config.train.num_train_epochs} | "
                         f"Step: {step_count}/{num_training_steps} | "
                         f"Loss: {avg_loss:.4f} | "
                         f"LR: {lr_scheduler.get_last_lr()[0]:.7f} | "
+                        f"Samples/sec: {samples_per_second:.2f} | "
                         f"Elapsed: {elapsed:.2f}s"
                     )
                     
@@ -314,12 +427,23 @@ def train(
                                 )
                                 sample_output_text = tokenizer.decode(sample_output[0], skip_special_tokens=False)
                                 logger.info(f"Sample generation: {sample_output_text}")
+                                
+                                # Log sample to wandb
+                                if wandb_enabled:
+                                    try:
+                                        import wandb
+                                        wandb.log({
+                                            "examples/input": wandb.Html(input_text),
+                                            "examples/output": wandb.Html(sample_output_text),
+                                        })
+                                    except Exception as e:
+                                        logger.warning(f"Failed to log examples to wandb: {e}")
                     
                     total_loss = 0.0
                 
                 # Evaluation
                 if val_dataloader is not None and step_count % config.train.eval_steps == 0:
-                    val_loss = evaluate(fabric, model, val_dataloader, config)
+                    val_loss = evaluate(fabric, model, val_dataloader, config, wandb_enabled, step_count)
                     fabric.log("val/loss", val_loss, step=step_count)
                     logger.info(f"Validation loss: {val_loss:.4f}")
                     model.train()
@@ -327,26 +451,48 @@ def train(
                 # Save checkpoint
                 if step_count % config.train.save_steps == 0 and fabric.global_rank == 0:
                     save_checkpoint(
-                        fabric, model, optimizer, lr_scheduler, step_count, config
+                        fabric, model, optimizer, lr_scheduler, step_count, config, wandb_enabled=wandb_enabled
                     )
         
         # End of epoch
         epoch_t1 = time.time()
-        logger.info(f"Epoch {epoch+1} finished in {epoch_t1 - epoch_t0:.2f} seconds")
+        epoch_time = epoch_t1 - epoch_t0
+        logger.info(f"Epoch {epoch+1} finished in {epoch_time:.2f} seconds")
+        
+        # Log epoch stats to wandb
+        if wandb_enabled and fabric.global_rank == 0:
+            try:
+                import wandb
+                wandb.log({
+                    "train/epoch": epoch + 1,
+                    "train/epoch_time": epoch_time,
+                })
+            except Exception as e:
+                logger.warning(f"Failed to log epoch stats to wandb: {e}")
         
         # Save checkpoint at end of epoch
         if fabric.global_rank == 0:
             save_checkpoint(
-                fabric, model, optimizer, lr_scheduler, step_count, config, is_final=(epoch == config.train.num_train_epochs - 1)
+                fabric, model, optimizer, lr_scheduler, step_count, config, 
+                is_final=(epoch == config.train.num_train_epochs - 1),
+                wandb_enabled=wandb_enabled
             )
     
     # Final evaluation
     if val_dataloader is not None and fabric.global_rank == 0:
-        val_loss = evaluate(fabric, model, val_dataloader, config)
+        val_loss = evaluate(fabric, model, val_dataloader, config, wandb_enabled, step_count)
         fabric.log("val/loss", val_loss, step=step_count)
         logger.info(f"Final validation loss: {val_loss:.4f}")
     
     logger.info(f"Training completed in {time.time() - total_t0:.2f} seconds")
+    
+    # Close wandb
+    if wandb_enabled and fabric.global_rank == 0:
+        try:
+            import wandb
+            wandb.finish()
+        except Exception as e:
+            logger.warning(f"Failed to close wandb: {e}")
 
 
 def evaluate(
@@ -354,6 +500,8 @@ def evaluate(
     model: Union[GPT, GPTLora],
     val_dataloader: torch.utils.data.DataLoader,
     config: Config,
+    wandb_enabled: bool = False,
+    step_count: int = 0,
 ) -> float:
     """
     Evaluate the model on validation data.
@@ -363,6 +511,8 @@ def evaluate(
         model: Model to evaluate
         val_dataloader: Validation dataloader
         config: Training configuration
+        wandb_enabled: Whether wandb logging is enabled
+        step_count: Current training step
         
     Returns:
         Average validation loss
@@ -386,6 +536,17 @@ def evaluate(
     # Average loss
     val_loss /= len(val_dataloader)
     
+    # Log to wandb
+    if wandb_enabled and fabric.global_rank == 0:
+        try:
+            import wandb
+            wandb.log({
+                "val/loss": val_loss,
+                "val/step": step_count,
+            })
+        except Exception as e:
+            logger.warning(f"Failed to log validation loss to wandb: {e}")
+    
     return val_loss
 
 
@@ -397,6 +558,7 @@ def save_checkpoint(
     step_count: int,
     config: Config,
     is_final: bool = False,
+    wandb_enabled: bool = False,
 ) -> None:
     """
     Save model checkpoint.
@@ -409,6 +571,7 @@ def save_checkpoint(
         step_count: Current training step
         config: Training configuration
         is_final: Whether this is the final checkpoint
+        wandb_enabled: Whether wandb logging is enabled
     """
     checkpoint_dir = (
         os.path.join(config.train.output_dir, f"checkpoint-{step_count}")
@@ -444,12 +607,94 @@ def save_checkpoint(
         s3_path = f"s3://{config.train.sagemaker_bucket}/medical-llm-finetuning/checkpoints/checkpoint-{step_count}"
         logger.info(f"Uploading checkpoint to {s3_path}")
         upload_to_s3(checkpoint_dir, s3_path)
+    
+    # Log to wandb if available
+    if wandb_enabled:
+        try:
+            import wandb
+            
+            # Create a metadata file for the checkpoint
+            metadata = {
+                "step": step_count,
+                "is_final": is_final,
+                "date": datetime.now().isoformat(),
+                "config": config.__dict__,
+            }
+            
+            with open(os.path.join(checkpoint_dir, "metadata.json"), "w") as f:
+                json.dump(metadata, f, indent=2, default=str)
+            
+            # Log the checkpoint as an artifact
+            if wandb.run is not None:
+                artifact = wandb.Artifact(
+                    name=f"model-checkpoint-{step_count}",
+                    type="model",
+                    description=f"Model checkpoint at step {step_count}" + (" (final)" if is_final else ""),
+                )
+                artifact.add_dir(checkpoint_dir)
+                wandb.log_artifact(artifact)
+                logger.info(f"Logged checkpoint to wandb: {artifact.name}")
+        except Exception as e:
+            logger.warning(f"Failed to log checkpoint to wandb: {e}")
+
+
+def log_gpu_memory_stats(wandb_enabled: bool = False):
+    """
+    Log GPU memory statistics.
+    
+    Args:
+        wandb_enabled: Whether wandb logging is enabled
+    """
+    if not torch.cuda.is_available():
+        return
+    
+    try:
+        gpu_stats = []
+        for i in range(torch.cuda.device_count()):
+            memory_allocated = torch.cuda.memory_allocated(i) / (1024 ** 3)  # GB
+            memory_reserved = torch.cuda.memory_reserved(i) / (1024 ** 3)    # GB
+            max_memory_allocated = torch.cuda.max_memory_allocated(i) / (1024 ** 3)  # GB
+            
+            logger.info(f"GPU {i}: {torch.cuda.get_device_name(i)}")
+            logger.info(f"  Memory Allocated: {memory_allocated:.2f} GB")
+            logger.info(f"  Memory Reserved: {memory_reserved:.2f} GB")
+            logger.info(f"  Max Memory Allocated: {max_memory_allocated:.2f} GB")
+            
+            gpu_stats.append({
+                "device": i,
+                "name": torch.cuda.get_device_name(i),
+                "memory_allocated_gb": memory_allocated,
+                "memory_reserved_gb": memory_reserved,
+                "max_memory_allocated_gb": max_memory_allocated,
+            })
+        
+        # Log to wandb
+        if wandb_enabled:
+            try:
+                import wandb
+                for stats in gpu_stats:
+                    wandb.log({
+                        f"gpu/{stats['device']}/memory_allocated_gb": stats["memory_allocated_gb"],
+                        f"gpu/{stats['device']}/memory_reserved_gb": stats["memory_reserved_gb"],
+                        f"gpu/{stats['device']}/max_memory_allocated_gb": stats["max_memory_allocated_gb"],
+                    })
+            except Exception as e:
+                logger.warning(f"Failed to log GPU stats to wandb: {e}")
+    except Exception as e:
+        logger.warning(f"Failed to get GPU memory stats: {e}")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Train LLaMA 3.1 8B on medical QA data")
     parser.add_argument("--config", type=str, default="configs/train_config.json", help="Path to training configuration")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint directory for resuming training")
+    parser.add_argument("--wandb_project", type=str, default=os.environ.get("WANDB_PROJECT", "medical-llm-finetuning"), 
+                        help="WandB project name")
+    parser.add_argument("--wandb_entity", type=str, default=os.environ.get("WANDB_ENTITY", None), 
+                        help="WandB entity (username or team)")
+    parser.add_argument("--wandb_run_name", type=str, default=None, 
+                        help="WandB run name (defaults to timestamp if not provided)")
+    parser.add_argument("--disable_wandb", action="store_true", help="Disable WandB logging")
     
     args = parser.parse_args()
     
@@ -465,8 +710,28 @@ def main():
     if args.resume:
         config.train.resume_from_checkpoint = args.resume
     
+    # Setup WandB if enabled
+    wandb_enabled = not args.disable_wandb and os.environ.get("WANDB_API_KEY") is not None
+    if wandb_enabled:
+        wandb_enabled = setup_wandb(config, args)
+    
     # Setup Lightning Fabric
     fabric = setup_fabric(config)
+    
+    # Log system information
+    if fabric.global_rank == 0:
+        logger.info(f"Python version: {sys.version}")
+        logger.info(f"PyTorch version: {torch.__version__}")
+        logger.info(f"CUDA version: {torch.version.cuda}")
+        logger.info(f"CUDA available: {torch.cuda.is_available()}")
+        logger.info(f"Number of GPUs: {torch.cuda.device_count()}")
+        
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                logger.info(f"GPU {i}: {torch.cuda.get_device_name(i)}")
+        
+        # Log GPU memory stats
+        log_gpu_memory_stats(wandb_enabled)
     
     # Load tokenizer
     tokenizer = load_tokenizer(config)
@@ -517,7 +782,13 @@ def main():
         val_dataloader=val_dataloader,
         config=config,
         tokenizer=tokenizer,
+        wandb_enabled=wandb_enabled,
     )
+    
+    # Final memory stats
+    if fabric.global_rank == 0:
+        logger.info("Final GPU memory stats:")
+        log_gpu_memory_stats(wandb_enabled)
 
 
 if __name__ == "__main__":
