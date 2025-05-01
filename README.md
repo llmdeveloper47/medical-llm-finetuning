@@ -43,6 +43,10 @@ This project fine-tunes the LLaMA 3.1 8B model on the MedQA dataset to create a 
 git clone https://github.com/yourusername/medical-llm-finetuning.git
 cd medical-llm-finetuning
 bash scripts/setup.sh
+
+chmod +x scripts/install_git_lfs.sh
+bash scripts/install_git_lfs.sh
+git lfs version
 ```
 
 3. **Initialize and activate Conda environment**:
