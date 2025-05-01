@@ -57,7 +57,7 @@ conda init bash
 source ~/.bashrc
 
 # Now you can activate the environment
-conda activate medical_llm
+conda activate medical_llm_training
 ```
 
 4. **Install dependencies**:
