@@ -67,6 +67,8 @@ python -m torch.distributed.run \
     --master_port=29500 \
     src/training/train.py \
     --config=configs/train_config.json \
+    $RESUME_ARG \
+    $WANDB_ARG \
     2>&1 | tee $LOG_FILE
 
 echo "Training completed!"
