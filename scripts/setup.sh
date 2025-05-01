@@ -3,6 +3,11 @@ set -e
 
 echo "Setting up environment for LLaMA 3.1 8B medical fine-tuning..."
 
+# Initialize conda for bash (prevents issues with conda activate)
+echo "Initializing conda for bash..."
+conda init bash
+source ~/.bashrc
+
 # Create conda environment
 echo "Creating conda environment..."
 conda create -n medical_llm python=3.10 -y
@@ -39,13 +44,53 @@ chmod +x scripts/*.sh
 
 # Set up Hugging Face credentials for accessing LLaMA 3.1
 echo "Setting up Hugging Face credentials..."
-python -c "from huggingface_hub import login; login()"
+# Option 1: Pass token interactively (more secure)
+read -p "Enter your Hugging Face token: " hf_token
+python -c "from huggingface_hub import login; login(token='$hf_token')"
+
+# Option 2: Alternatively, you can set the token directly in the script (less secure)
+# export HUGGING_FACE_HUB_TOKEN="your_hf_token_here"
+# python -c "from huggingface_hub import login; login(token='$HUGGING_FACE_HUB_TOKEN')"
+
+# Option 3: Use token from environment variable if already set
+# if [ -z "$HUGGING_FACE_HUB_TOKEN" ]; then
+#   read -p "Enter your Hugging Face token: " hf_token
+#   python -c "from huggingface_hub import login; login(token='$hf_token')"
+# else
+#   python -c "from huggingface_hub import login; login(token='$HUGGING_FACE_HUB_TOKEN')"
+# fi
 
 # Set up WandB for experiment tracking (optional)
-echo "Setting up Weights & Biases for experiment tracking (optional)..."
+echo "Setting up Weights & Biases for experiment tracking..."
 read -p "Would you like to set up WandB for experiment tracking? (y/n) " wandb_setup
 if [[ $wandb_setup == "y" || $wandb_setup == "Y" ]]; then
+    # Check if WANDB_API_KEY is already set in the environment
+    if [[ -z "${WANDB_API_KEY}" ]]; then
+        read -p "Enter your WandB API key: " wandb_key
+        # Add to environment variables
+        echo "export WANDB_API_KEY=$wandb_key" >> ~/.bashrc
+        export WANDB_API_KEY=$wandb_key
+    fi
+    
+    # Login to wandb
     wandb login
+    
+    # Create a project if it doesn't exist
+    read -p "Enter WandB project name (default: medical-llm-finetuning): " wandb_project
+    wandb_project=${wandb_project:-medical-llm-finetuning}
+    export WANDB_PROJECT=$wandb_project
+    echo "export WANDB_PROJECT=$wandb_project" >> ~/.bashrc
+    
+    # Set entity (team/username)
+    read -p "Enter your WandB entity/username (press Enter to use default): " wandb_entity
+    if [[ ! -z "$wandb_entity" ]]; then
+        export WANDB_ENTITY=$wandb_entity
+        echo "export WANDB_ENTITY=$wandb_entity" >> ~/.bashrc
+    fi
+    
+    echo "WandB configured successfully!"
+else
+    echo "Skipping WandB setup. To set it up later, run 'wandb login'."
 fi
 
 echo "Setting up SageMaker-specific configurations..."
