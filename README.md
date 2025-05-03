@@ -45,11 +45,12 @@ cd medical-llm-finetuning
 cd scripts
 ./cuda_check_fix.sh
 
-Follow the instructions on the screen, if torch and cuda aren't compatible then choose y to ensure torch and cuda are compatible.
-then run the following:
+#Follow the instructions on the screen, if torch and cuda aren't compatible then choose y to ensure torch and cuda are compatible.
+#then run the following:
 
+# this will automatically set your cuda path for torch's usage and won't re-install torch 
 chmod +x scripts/setup.sh    
-bash scripts/setup.sh          ( this will automatically set your cuda path for torch's usage and won't re-install torch )
+bash scripts/setup.sh          
 
 chmod +x scripts/install_git_lfs.sh
 bash scripts/install_git_lfs.sh
