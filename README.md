@@ -42,6 +42,7 @@ This project fine-tunes the LLaMA 3.1 8B model on the MedQA dataset to create a 
 ```bash
 git clone https://github.com/yourusername/medical-llm-finetuning.git
 cd medical-llm-finetuning
+chmod +x scripts/setup.sh
 bash scripts/setup.sh
 
 chmod +x scripts/install_git_lfs.sh
